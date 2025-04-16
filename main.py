@@ -5,6 +5,152 @@ import math
 from pathlib import Path
 import glob
 import logging
+import re
+
+class MultiHeadAttentionFused(nn.Module):
+    """
+    Multi-Head Attention layer with fused QKV projection.
+
+    This layer computes scaled dot-product attention similarly to
+    [nn.MultiHeadAttention](https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.MultiHeadAttention.html),
+    but fuses the linear projections for queries, keys, and values into a
+    single `in_proj` layer for potential efficiency gains. It also supports
+    `key_padding_mask`.
+
+    Note: This implementation assumes that the input dimensions for queries,
+    keys, and values are the same (`dims`).
+    """
+    def __init__(
+        self,
+        dims: int,
+        num_heads: int,
+        query_input_dims: Optional[int] = None,
+        key_input_dims: Optional[int] = None,
+        value_input_dims: Optional[int] = None,
+        value_dims: Optional[int] = None,
+        value_output_dims: Optional[int] = None,
+        bias: bool = True,
+    ):
+        super().__init__()
+
+        # Ensure divisibility
+        if (dims % num_heads) != 0:
+            raise ValueError(
+                "The input feature dimensions should be divisible by the "
+                f"number of heads ({dims} % {num_heads}) != 0"
+            )
+
+        # For fused projection, input dimensions must match 'dims'
+        if query_input_dims is not None and query_input_dims != dims:
+             raise ValueError(f"query_input_dims ({query_input_dims}) must equal dims ({dims}) for fused projection")
+        if key_input_dims is not None and key_input_dims != dims:
+             raise ValueError(f"key_input_dims ({key_input_dims}) must equal dims ({dims}) for fused projection")
+        if value_input_dims is not None and value_input_dims != dims:
+             raise ValueError(f"value_input_dims ({value_input_dims}) must equal dims ({dims}) for fused projection")
+
+        # Set dimensions, using defaults if necessary
+        value_dims = value_dims or dims
+        value_output_dims = value_output_dims or dims
+
+        self.num_heads = num_heads
+        self.dims = dims # Store dims for splitting
+        self.value_dims = value_dims # Store value_dims for splitting
+
+        # Fused input projection for Q, K, V
+        # Total output dimension = dims (Q) + dims (K) + value_dims (V)
+        self.in_proj = nn.Linear(dims, dims + dims + value_dims, bias=bias)
+
+        # Output projection
+        self.out_proj = nn.Linear(value_dims, value_output_dims, bias=bias)
+
+    def __call__(self, x: mx.array, mask: Optional[mx.array] = None, key_padding_mask: Optional[mx.array] = None):
+        """
+        Apply multi-head attention.
+
+        Args:
+            x (mx.array): Input tensor expected to be of shape
+                (batch_size, sequence_length, dims). This tensor serves as the
+                source for queries, keys, and values.
+            mask (Optional[mx.array]): An additive mask for the attention scores.
+                Typically used for causal masking. Shape should be broadcastable
+                to (batch_size, num_heads, query_seq_len, key_seq_len).
+            key_padding_mask (Optional[mx.array]): A boolean mask indicating
+                padded positions in the keys. Shape (batch_size, key_seq_len).
+                `True` indicates a padded position that should be masked.
+
+        Returns:
+            mx.array: The output tensor after attention and output projection.
+        """
+        B, L, _ = x.shape # Batch size, sequence length, dimensions
+
+        # 1. Fused Projection and Split
+        qkv = self.in_proj(x)
+        queries, keys, values = mx.split(qkv, [self.dims, self.dims, self.value_dims], axis=-1)
+
+        # 2. Reshape for Multi-Head Attention
+        # Reshape from (B, L, D) to (B, num_heads, L, head_dim)
+        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        # Use value_dims for reshaping V
+        value_head_dim = self.value_dims // self.num_heads
+        values = values.reshape(B, L, self.num_heads, value_head_dim).transpose(0, 2, 1, 3)
+
+        # 3. Scale
+        head_dim = queries.shape[-1]
+        scale = math.sqrt(1 / head_dim)
+
+        # 4. Prepare Masking
+        merged_mask = mask # Start with the causal/attention mask if provided
+
+        if key_padding_mask is not None:
+            # Convert boolean key_padding_mask to additive float mask
+            # key_padding_mask is (B, L) -> needs to be (B, 1, 1, L) for broadcasting
+            additive_key_padding_mask = key_padding_mask[:, None, None, :].astype(mx.float32) * mx.finfo(mx.float32).min
+
+            if merged_mask is None:
+                merged_mask = additive_key_padding_mask
+            else:
+                # Ensure mask has compatible float type before adding
+                if merged_mask.dtype != additive_key_padding_mask.dtype:
+                     # This might happen if causal mask was created with different dtype
+                     merged_mask = merged_mask.astype(additive_key_padding_mask.dtype)
+                merged_mask = merged_mask + additive_key_padding_mask
+
+        # Note: The original code had a transpose here (merged_mask.transpose(3, 1, 2, 0))
+        # which seemed incorrect for the expected mask shape of scaled_dot_product_attention.
+        # The mask should broadcast to (B, num_heads, query_len, key_len).
+        # The created merged_mask (from key_padding_mask and/or causal mask)
+        # should already align with these dimensions or be broadcastable.
+
+        # 5. Scaled Dot-Product Attention
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=merged_mask
+        )
+
+        # 6. Reshape and Output Projection
+        # Reshape from (B, num_heads, L, value_head_dim) -> (B, L, num_heads * value_head_dim) = (B, L, value_dims)
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1) # Use self.value_dims implied by flatten
+        return self.out_proj(output)
+
+    @staticmethod
+    def create_additive_causal_mask(N: int, dtype: mx.Dtype = mx.float32):
+        """
+        Creates an additive causal mask for attention.
+
+        Args:
+            N (int): The sequence length.
+            dtype (mx.Dtype, optional): The data type of the mask. Defaults to mx.float32.
+
+        Returns:
+            mx.array: A mask of shape (N, N) where future positions are masked.
+        """
+        indices = mx.arange(N)
+        mask = indices[:, None] < indices[None]
+        # Add dimensions for broadcasting: (1, 1, N, N) or just (N,N) if handled by attention fn
+        mask = mask.astype(dtype) * mx.finfo(dtype).min
+        # Often needs expansion for batch/heads, but depends on attention implementation.
+        # mx.fast.scaled_dot_product_attention handles broadcasting from (N, N).
+        return mask
 
 class MultiHeadAttention(nn.Module):
     """
@@ -97,7 +243,7 @@ class Conv(nn.Module):
         num_channels: int,
         depthwise_kernel_size: int,
         dropout: float = 0.0,
-        bias: bool = False,
+        bias: bool = True,
         use_group_norm: bool = False,
     ) -> None:
         super().__init__()
@@ -113,7 +259,7 @@ class Conv(nn.Module):
                 1,
                 stride=1,
                 padding=0,
-                bias=bias,
+                bias=True,
             ),
             nn.GLU(axis=2),
             nn.Conv1d(
@@ -210,10 +356,10 @@ class ConformerLayer(nn.Module):
         self.ffn1 = FeedForward(input_dim, ffn_dim, dropout)
 
         self.self_attn_layer_norm = nn.LayerNorm(input_dim)
-        self.self_attn = MultiHeadAttention(input_dim, num_attention_heads)  # nodropout
+        self.self_attn = MultiHeadAttentionFused(input_dim, num_attention_heads)  # nodropout
         self.self_attn_dropout = nn.Dropout(dropout)
 
-        self.conv = Conv(
+        self.conv_module = Conv(
             input_dim,
             input_dim,
             depthwise_conv_kernel_size,
@@ -229,7 +375,7 @@ class ConformerLayer(nn.Module):
     def _apply_conv(self, x: mx.array) -> mx.array:
         residual = x
         x = x.transpose(1, 0, 2)
-        x = self.conv(x)
+        x = self.conv_module(x)
         x = x.transpose(2, 0, 1)
         x = x + residual
         return x
@@ -364,6 +510,7 @@ class Conformer(nn.Module):
             num_layers=4,
             depthwise_conv_kernel_size=31,
         )
+        print("Model: ", model)
         weight_files = glob.glob(str(path / "*.safetensors"))
         if not weight_files:
             logging.error(f"No safetensors found in {path}")
@@ -381,22 +528,19 @@ class Conformer(nn.Module):
     def sanitize(weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            elif "patch_embedding.weight" in k:
-                # pytorch conv2d expects the weight tensor to be of shape [out_channels, in_channels, kH, KW]
-                # mlx conv2d expects the weight tensor to be of shape [out_channels, kH, KW, in_channels]
-                sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+            if "in_proj_weight" in k:
+                new_key = k.replace("in_proj_weight", "in_proj.weight")
+                sanitized_weights[new_key] = v
+            elif "in_proj_bias" in k:
+                new_key = k.replace("in_proj_bias", "in_proj.bias")
+                sanitized_weights[new_key] = v
             else:
                 sanitized_weights[k] = v
-
         return sanitized_weights
-
 
 if __name__ == "__main__":
     input_dim = 80
-    conformer = Conformer.from_pretrained(".")
+    conformer = Conformer.from_pretrained("./weights")
     lengths = mx.random.randint(1, 400, (10,))  # (batch,)
     input = mx.random.uniform(
         low=0, high=1, shape=[10, int(lengths.max()), input_dim]

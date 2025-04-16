@@ -43,7 +43,7 @@ class _ConvolutionModule(torch.nn.Module):
             raise ValueError(
                 "depthwise_kernel_size must be odd to achieve 'SAME' padding."
             )
-        self.layer_norm = torch.nn.LayerNorm(input_dim)
+        self.layer_norm = torch.nn.LayerNorm(input_dim, elementwise_affine=False)
         self.sequential = torch.nn.Sequential(
             torch.nn.Conv1d(
                 input_dim,
@@ -65,7 +65,7 @@ class _ConvolutionModule(torch.nn.Module):
             ),
             torch.nn.GroupNorm(num_groups=1, num_channels=num_channels)
             if use_group_norm
-            else torch.nn.BatchNorm1d(num_channels),
+            else torch.nn.BatchNorm1d(num_channels, track_running_stats=False),
             torch.nn.SiLU(),
             torch.nn.Conv1d(
                 num_channels,
@@ -152,7 +152,7 @@ class ConformerLayer(torch.nn.Module):
 
         self.ffn1 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
 
-        self.self_attn_layer_norm = torch.nn.LayerNorm(input_dim)
+        self.self_attn_layer_norm = torch.nn.LayerNorm(input_dim, elementwise_affine=False)
         self.self_attn = torch.nn.MultiheadAttention(
             input_dim, num_attention_heads, dropout=dropout
         )
@@ -168,7 +168,7 @@ class ConformerLayer(torch.nn.Module):
         )
 
         self.ffn2 = _FeedForwardModule(input_dim, ffn_dim, dropout=dropout)
-        self.final_layer_norm = torch.nn.LayerNorm(input_dim)
+        self.final_layer_norm = torch.nn.LayerNorm(input_dim, elementwise_affine=False)
         self.convolution_first = convolution_first
 
     def _apply_convolution(self, input: torch.Tensor) -> torch.Tensor:
@@ -303,6 +303,37 @@ class Conformer(torch.nn.Module):
         return x.transpose(0, 1), lengths
 
 
+import re
+from itertools import starmap
+from pathlib import Path
+from typing import Any
+
+import mlx.core as mx
+import numpy as np
+
+def map_torch_to_mlx(
+    key: str, value: torch.Tensor
+) -> tuple[str, mx.array] | tuple[None, None]:
+    # First, find all occurrences of the pattern
+    matches = list(re.finditer(r'\.[0-9]+', key))
+    
+    # Only apply the replacement if there are 2 or more matches
+    if len(matches) >= 2:
+        # Replace only the last occurrence
+        last_match = matches[-1]
+        start, end = last_match.span()
+        key = key[:start] + f".layers{last_match.group(0)}" + key[end:]
+    
+    if key.endswith("weight") and value.dim() == 4:
+        value = value.permute(0, 2, 3, 1)
+    elif key.endswith("num_batches_tracked"):
+        return None, None
+    return key, mx.array(value.numpy())
+
+def convert_weights(state: dict[str, Any]) -> dict[str, np.ndarray]:
+    return {k: v for k, v in starmap(map_torch_to_mlx, state.items()) if k is not None}
+
+
 if __name__ == "__main__":
     input_dim = 80
     conformer = Conformer(
@@ -320,6 +351,20 @@ if __name__ == "__main__":
     output = conformer(input, lengths)
 
     state_dict = conformer.state_dict()
-    save_file(state_dict, "conformer.safetensors")
+
+
+    weights_dir = Path("weights")
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    state = conformer.state_dict()
+    weights = convert_weights(state)
+
+    mx.save_safetensors(
+        str(weights_dir / "conformer.safetensors"), arrays=weights
+    )
 
     print(f"Output: {output}")
+
+
+
+
