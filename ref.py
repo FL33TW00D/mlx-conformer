@@ -6,6 +6,7 @@ https://github.com/pytorch/audio/blob/main/src/torchaudio/models/conformer.py @ 
 
 from typing import Optional, Tuple
 import torch
+from safetensors.torch import save_file
 
 
 def _lengths_to_padding_mask(lengths: torch.Tensor) -> torch.Tensor:
@@ -317,4 +318,8 @@ if __name__ == "__main__":
         10, int(lengths.max()), input_dim
     )  # (batch, num_frames, input_dim)
     output = conformer(input, lengths)
+
+    state_dict = conformer.state_dict()
+    save_file(state_dict, "conformer.safetensors")
+
     print(f"Output: {output}")

@@ -2,14 +2,15 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import math
-
+from pathlib import Path
+import glob
+import logging
 
 class MultiHeadAttention(nn.Module):
     """
     Identical to [nn.MultiHeadAttention](https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.MultiHeadAttention.html)
     but with support for `key_padding_mask`
     """
-
     def __init__(
         self,
         dims: int,
@@ -352,15 +353,50 @@ class Conformer(nn.Module):
         return input.transpose(1, 0, 2), lengths
 
 
+    @staticmethod
+    def from_pretrained(path: str):
+        path = Path(path)
+
+        model = Conformer(
+            input_dim=80,
+            num_heads=4,
+            ffn_dim=128,
+            num_layers=4,
+            depthwise_conv_kernel_size=31,
+        )
+        weight_files = glob.glob(str(path / "*.safetensors"))
+        if not weight_files:
+            logging.error(f"No safetensors found in {path}")
+            raise FileNotFoundError(f"No safetensors found in {path}")
+
+        weights = {}
+        for wf in weight_files:
+            weights.update(mx.load(wf))
+
+        weights = model.sanitize(weights)
+        model.load_weights(list(weights.items()))
+        return model
+
+    @staticmethod
+    def sanitize(weights):
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            elif "patch_embedding.weight" in k:
+                # pytorch conv2d expects the weight tensor to be of shape [out_channels, in_channels, kH, KW]
+                # mlx conv2d expects the weight tensor to be of shape [out_channels, kH, KW, in_channels]
+                sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+            else:
+                sanitized_weights[k] = v
+
+        return sanitized_weights
+
+
 if __name__ == "__main__":
     input_dim = 80
-    conformer = Conformer(
-        input_dim=input_dim,
-        num_heads=4,
-        ffn_dim=128,
-        num_layers=4,
-        depthwise_conv_kernel_size=31,
-    )
+    conformer = Conformer.from_pretrained(".")
     lengths = mx.random.randint(1, 400, (10,))  # (batch,)
     input = mx.random.uniform(
         low=0, high=1, shape=[10, int(lengths.max()), input_dim]
